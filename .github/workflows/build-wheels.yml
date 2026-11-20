@@ -38,6 +38,15 @@ jobs:
           sudo docker image prune -af >/dev/null 2>&1 || true
           df -h /
 
+      - name: Add swap (safety net against out-of-memory kills)
+        run: |
+          sudo swapoff -a || true
+          sudo fallocate -l 24G /swapfile2
+          sudo chmod 600 /swapfile2
+          sudo mkswap /swapfile2 >/dev/null
+          sudo swapon /swapfile2
+          free -h
+
       - name: Install CUDA toolkit ${{ env.CUDA_TOOLKIT }}
         run: |
           wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
@@ -88,8 +97,8 @@ jobs:
         env:
           FLASH_ATTN_CUDA_ARCHS: ${{ matrix.arch }}
           FLASH_ATTENTION_FORCE_BUILD: "TRUE"
-          MAX_JOBS: "2"        # 16 GB runner RAM: 2 jobs x 2 nvcc threads is safe
-          NVCC_THREADS: "2"    # nvcc compiles the archs of one file in parallel
+          MAX_JOBS: "2"        # two files at a time
+          NVCC_THREADS: "1"    # each nvcc handles its archs one by one: half the peak memory of 2
         run: |
           # "80;120" -> TORCH_CUDA_ARCH_LIST="8.0;12.0" (no GPU here to detect)
           LIST=""
@@ -97,12 +106,31 @@ jobs:
           export TORCH_CUDA_ARCH_LIST="${LIST#;}"
           echo "FLASH_ATTN_CUDA_ARCHS=$FLASH_ATTN_CUDA_ARCHS TORCH_CUDA_ARCH_LIST=$TORCH_CUDA_ARCH_LIST"
           PY="$GITHUB_WORKSPACE/nanovllm/.venv/bin/python"
+          LOG="$GITHUB_WORKSPACE/build.log"
           uv pip install --no-config --python "$PY" pip setuptools wheel ninja packaging psutil
+          # memory report every 2 minutes, so a slow death is visible in the log
+          ( while sleep 120; do
+              free -m | awk -v t="$(date +%H:%M)" 'NR==2{printf "[%s] RAM used %d MB, available %d MB", t, $3, $7} NR==3{printf ", swap used %d MB\n", $3}'
+            done ) &
+          MON=$!
           cd /tmp
+          set -o pipefail
+          # full output to build.log; ninja progress lines ([12/73] ...) and errors to the console
           time "$PY" -m pip wheel --no-build-isolation --no-deps -v \
-            -w "$GITHUB_WORKSPACE/dist" "$GITHUB_WORKSPACE/fa-src" 2>&1 | tail -50
+            -w "$GITHUB_WORKSPACE/dist" "$GITHUB_WORKSPACE/fa-src" 2>&1 \
+            | tee "$LOG" | grep --line-buffered -E '^\[[0-9]+/[0-9]+\]|error|Error|FAILED|Killed' | cut -c1-220
+          kill $MON || true
           ls -lh "$GITHUB_WORKSPACE/dist"
           test -n "$(ls "$GITHUB_WORKSPACE"/dist/*.whl)"
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-sm${{ strategy.job-index }}
+          path: build.log
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Publish wheel to release
         env:

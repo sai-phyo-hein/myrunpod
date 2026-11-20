@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       archs:
-        description: 'JSON list: 80 = Ampere/Ada (3090, 4090, A4000, A100, L4, L40S), 90 = Hopper (H100), 100 = B200, 120 = RTX Blackwell (RTX PRO, 5090)'
+        description: 'JSON list. 80 = Ampere/Ada (3090, 4090, A4000, A100, L4, L40S), 90 = Hopper (H100), 100 = B200, 120 = RTX Blackwell (RTX PRO, 5090). Combine with ";" for one multi-GPU wheel, e.g. ["80;120"] (compiles ~2x longer)'
         required: true
         default: '["80","90","120"]'
 
@@ -89,10 +89,13 @@ jobs:
           FLASH_ATTN_CUDA_ARCHS: ${{ matrix.arch }}
           FLASH_ATTENTION_FORCE_BUILD: "TRUE"
           MAX_JOBS: "2"        # 16 GB runner RAM: 2 jobs x 2 nvcc threads is safe
-          NVCC_THREADS: "2"
+          NVCC_THREADS: "2"    # nvcc compiles the archs of one file in parallel
         run: |
-          A="${{ matrix.arch }}"
-          export TORCH_CUDA_ARCH_LIST="${A:0:-1}.${A: -1}"   # 120 -> 12.0, no GPU to detect
+          # "80;120" -> TORCH_CUDA_ARCH_LIST="8.0;12.0" (no GPU here to detect)
+          LIST=""
+          for A in ${FLASH_ATTN_CUDA_ARCHS//;/ }; do LIST="$LIST;${A:0:-1}.${A: -1}"; done
+          export TORCH_CUDA_ARCH_LIST="${LIST#;}"
+          echo "FLASH_ATTN_CUDA_ARCHS=$FLASH_ATTN_CUDA_ARCHS TORCH_CUDA_ARCH_LIST=$TORCH_CUDA_ARCH_LIST"
           PY="$GITHUB_WORKSPACE/nanovllm/.venv/bin/python"
           uv pip install --no-config --python "$PY" pip setuptools wheel ninja packaging psutil
           cd /tmp
@@ -105,7 +108,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          TAG="fa${FLASH_ATTN_VERSION}-nv${NANOVLLM_REF}-sm${{ matrix.arch }}"
+          A="${{ matrix.arch }}"
+          TAG="fa${FLASH_ATTN_VERSION}-nv${NANOVLLM_REF}-sm${A//;/-}"   # 80;120 -> sm80-120
           gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "$TAG" \
             --notes "flash-attn ${FLASH_ATTN_VERSION} for sm_${{ matrix.arch }}, built against nanovllm-voxcpm@${NANOVLLM_REF} (torch from its uv.lock), Python ${PYTHON_VERSION}."
           gh release upload "$TAG" dist/*.whl --clobber

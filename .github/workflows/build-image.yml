@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       archs:
-        description: 'JSON list of archs to build (must already have wheels)'
+        description: 'JSON list of archs to build, same entries as the wheel build, e.g. ["80;120"] (wheels must exist)'
         required: true
         default: '["80","90","120"]'
       install_voxcpm:
@@ -46,7 +46,10 @@ jobs:
       - uses: actions/checkout@v5
 
       - name: Load versions.env
-        run: grep -E '^[A-Z_]+=' versions.env >> "$GITHUB_ENV"
+        run: |
+          grep -E '^[A-Z_]+=' versions.env >> "$GITHUB_ENV"
+          A="${{ matrix.arch }}"
+          echo "SUFFIX=${A//;/-}" >> "$GITHUB_ENV"     # 80;120 -> 80-120 (tags can't hold ";")
 
       - name: Free disk space
         run: |
@@ -60,7 +63,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          TAG="fa${FLASH_ATTN_VERSION}-nv${NANOVLLM_REF}-sm${{ matrix.arch }}"
+          TAG="fa${FLASH_ATTN_VERSION}-nv${NANOVLLM_REF}-sm${SUFFIX}"
           mkdir -p wheels
           if gh release download "$TAG" -p '*.whl' -D wheels; then
             ls -lh wheels
@@ -102,5 +105,5 @@ jobs:
             FA_ARCH=${{ matrix.arch }}
             INSTALL_VOXCPM=${{ (github.event_name == 'push' || inputs.install_voxcpm) && '1' || '0' }}
           tags: |
-            ${{ env.IMAGE }}:sm${{ matrix.arch }}
-            ${{ env.IMAGE }}:sm${{ matrix.arch }}-${{ env.SHORT_SHA }}
+            ${{ env.IMAGE }}:sm${{ env.SUFFIX }}
+            ${{ env.IMAGE }}:sm${{ env.SUFFIX }}-${{ env.SHORT_SHA }}

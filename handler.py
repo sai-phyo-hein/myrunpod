@@ -1,724 +1,561 @@
-"""VoxCPM2 text-to-speech worker for RunPod Serverless (queue-based endpoint).
-
-Input  (POST /runsync or /run, body {"input": {...}}):
-  action            "ping" returns worker info without generating (use it to measure cold start)
-  text              one sentence to synthesize            -> single-clip mode
-  script            a paragraph, auto-split into sentences -> lesson mode
-  sentences         explicit list of sentences             -> lesson mode
-  mode              "design" | "clone" | "hifi" (default: clone if a reference is sent, else design)
-                      design  voice from the style description alone; any reference is ignored
-                      clone   timbre from the reference clip, style steers emotion/pace
-                      hifi    reference clip + its exact transcript (prompt_text): closest match; style is ignored
-  prompt_text       exact transcript of the reference clip (required for hifi; alias: reference_text)
-  style             voice description (design) or style (clone), e.g. "A gentle, warm woman reading a bedtime story ..."
-  steps             diffusion steps, 2-30 (default 10; fewer = faster, rougher)
-  cfg               guidance scale, 0.5-5 (default 2.0)
-  seed              integer, optional
-  retry_badcase     bool (default false)
-  reference_b64     base64 of a reference voice clip (wav/mp3/flac/ogg), optional
-  reference_url     alternative to reference_b64: a (presigned) https URL of the clip, e.g. in R2. The worker downloads it
-                    once and keeps it on local disk. Send reference_id (the voice name) and reference_version (R2 ETag)
-                    too so a re-uploaded voice is fetched again while an unchanged one is reused.
-  gap_s             silence between sentences in lesson mode (default 0.7)
-  out_sample_rate   optional resample, e.g. 24000 (default: model rate, 48000)
-  return_clips      lesson mode: also return each sentence separately (default true)
-
-Sieng web app mode (the app's Vercel API sends this shape, no change needed on its side):
-  {"input": {"method": "POST", "path": "/api/generate", "body": {text, speed, reference_id, reference_url,
-   reference_version, group_id, project_id, process_id, ...}}}
-  Optional body.mode and body.prompt_text select the generation mode as above; without them, nothing changes.
-  The clip is generated with the reference voice, uploaded to R2 as body.output_key when given (a plain relative .wav path),
-  otherwise outputs/<group_id>/<project_id>/<process_id>.wav
-  and the handler returns {"audio_url": <presigned https URL>, "process_id": ..., "duration_s": ...}, which RunPod delivers as output.audio_url.
-  Needs R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET_NAME (optional R2_ENDPOINT, VOX_OUT_URL_TTL_S).
-  Long text is split into sentences (max VOX_MAX_CHARS each, up to VOX_MAX_SENTENCES pieces) and joined with short pauses.
-  "speed" below 0.85 / above 1.1 adds "speaking slowly" / "a little faster" to the style; "style" in the body is used as given.
-
-Environment variables:
-  VOX_MODEL_DIR     baked-in weights, default /models/VoxCPM2
-  CFG (VOX_CFG)    default cfg_value, 2.0 if unset; 3.0 makes the style clearer. A request's own "cfg" wins.
-  VOX_MODEL_SOURCE  auto (default: RunPod cached model if present, else baked) | cache | baked
-  VOX_HF_ID         Hugging Face id used to find the RunPod cached copy, default openbmb/VoxCPM2
-  VOX_DTYPE         float16 (default) or bfloat16
-  VOX_OPTIMIZE      0 (default) or 1 (torch.compile; slower start, unclear benefit)
-  VOX_MAX_CHARS     max characters per sentence (default 400)
-  VOX_REF_CACHE     how many encoded reference voices to keep in memory (default 8)
-  VOX_MAX_SENTENCES max sentences per request (default 12)
-  VOX_FAKE          1 = stand-in engine that makes tones (for testing the plumbing without a GPU)
+#!/usr/bin/env python3
 """
-import time as _time
-_T0 = _time.perf_counter()  # roughly "Python started"; used for boot_to_ready_s
+RunPod Serverless handler for VoxCPM2 text-to-speech.
 
+  ENGINE=nano     nanovllm-voxcpm: ~3.5x faster, serves several requests at once per worker
+  ENGINE=default  reference VoxCPM: slower, one request at a time
+
+Modes (https://voxcpm.readthedocs.io/en/latest/usage_guide.html#three-generation-modes):
+  design  voice from a text description, no reference audio
+  clone   timbre from reference audio, style from an optional instruction
+  hifi    reference audio + its exact transcript, highest similarity
+
+Request / response format: see README.md. Local test: python handler.py (reads test_input.json).
+"""
+from __future__ import annotations
+
+import asyncio
 import base64
-import collections
 import hashlib
+import inspect
 import io
 import json
 import os
 import re
+import subprocess
+import sys
 import tempfile
 import time
 import traceback
-import zlib
+import urllib.parse
+import urllib.request
+from collections import OrderedDict
+from dataclasses import dataclass, field
+from pathlib import Path
 
 import numpy as np
-import soundfile as sf
 import runpod
+import soundfile as sf
 
-FAKE = os.environ.get("VOX_FAKE", "0") == "1"
-MODEL_DIR = os.environ.get("VOX_MODEL_DIR", "/models/VoxCPM2")
-MODEL_SOURCE = os.environ.get("VOX_MODEL_SOURCE", "auto").lower()
-HF_ID = os.environ.get("VOX_HF_ID", "openbmb/VoxCPM2")
-CACHE_ROOT = os.environ.get("VOX_CACHE_ROOT", "/runpod-volume/huggingface-cache/hub")
-DTYPE = os.environ.get("VOX_DTYPE", "float16")
-OPTIMIZE = os.environ.get("VOX_OPTIMIZE", "0") == "1"
-MAX_CHARS = int(os.environ.get("VOX_MAX_CHARS", "400"))
-MAX_SENTENCES = int(os.environ.get("VOX_MAX_SENTENCES", "12"))
-REF_CACHE_SIZE = int(os.environ.get("VOX_REF_CACHE", "8"))
-MAX_REF_BYTES = int(os.environ.get("VOX_MAX_REF_BYTES", str(15 * 1024 * 1024)))
-REF_DIR = os.environ.get("VOX_REF_DIR", "/tmp/vox_refs")
-# Default seed for every request that does not send its own (VOX_SEED, or just SEED). Empty = random each time.
-DEFAULT_SEED = (os.environ.get("VOX_SEED") or os.environ.get("SEED") or "").strip()
-# cfg_value = how strongly the model follows the text and the style. 2.0 is VoxCPM's default; 3.0 gives clearer styles
-# (the test notebook uses 3.0) but can buzz on long text. Per-request "cfg" in the body still wins.
-try:
-    DEFAULT_CFG = float((os.environ.get("VOX_CFG") or os.environ.get("CFG") or "2.0").strip())
-except ValueError:
-    raise RuntimeError("CFG / VOX_CFG must be a number, e.g. 3.0")
-REF_DOWNLOAD_TIMEOUT_S = float(os.environ.get("VOX_REF_TIMEOUT_S", "20"))
-REF_ALLOW_HTTP = os.environ.get("VOX_ALLOW_HTTP", "0") == "1"           # tests only
-REF_HOSTS = [h.strip().lower() for h in os.environ.get("VOX_REF_HOSTS", "").split(",") if h.strip()]  # e.g. ".r2.cloudflarestorage.com"
-WARM_TEXT = "မင်္ဂလာပါ။"
+# --------------------------------------------------------------------------- config
+ENGINE_NAME = os.getenv("ENGINE", "nano").strip().lower()
+MODEL_ID = os.getenv("MODEL_ID", "openbmb/VoxCPM2")
+MAX_CONCURRENCY = max(1, int(os.getenv("MAX_CONCURRENCY", "8")))   # jobs per worker (nano)
+MAX_NUM_SEQS = int(os.getenv("MAX_NUM_SEQS", "16"))                # nano scheduler slots
+GPU_MEM_UTIL = float(os.getenv("GPU_MEM_UTIL", "0.85"))
+VOICES_DIR = Path(os.getenv("VOICES_DIR", "/app/voices"))
+MAX_TEXT_CHARS = int(os.getenv("MAX_TEXT_CHARS", "3000"))
+MAX_SEGMENT_CHARS = int(os.getenv("MAX_SEGMENT_CHARS", "250"))
+SEGMENT_GAP_S = float(os.getenv("SEGMENT_GAP_S", "0.15"))
+MAX_REF_BYTES = int(os.getenv("MAX_REF_MB", "20")) * 1024 * 1024
+MAX_REF_SECONDS = float(os.getenv("MAX_REF_SECONDS", "60"))
+ALLOW_REF_URL = os.getenv("ALLOW_REF_URL", "1") == "1"
+LATENT_CACHE_SIZE = int(os.getenv("LATENT_CACHE_SIZE", "32"))
+RETRY_BADCASE = os.getenv("RETRY_BADCASE", "1") == "1"            # default engine only
+SMOKE_TEST = os.getenv("SMOKE_TEST", "1") == "1"
+REFRESH_ON_ERROR = os.getenv("REFRESH_ON_ERROR", "1") == "1"
+IMAGE_FA_ARCH = os.getenv("FLASH_ATTN_ARCH", "")                   # baked in by the Dockerfile
+RUNPOD_HF_CACHE = os.getenv("RUNPOD_HF_CACHE", "/runpod-volume/huggingface-cache/hub")
+
 MODES = ("design", "clone", "hifi")
-MAX_PROMPT_TEXT_CHARS = int(os.environ.get("VOX_MAX_PROMPT_TEXT", "1000"))
-
-STATE = {"jobs": 0, "load_s": None, "warmup_s": None, "gpu": None}
-ENGINE = None
+AUDIO_EXTS = (".wav", ".flac", ".mp3", ".ogg")
+OUTPUT_FORMATS = ("wav", "flac")
 
 
-class UserError(Exception):
-    """Bad request: reported back to the caller as {"error": ...}."""
+def log(*args):
+    print("[handler]", *args, flush=True)
 
 
-# --------------------------------------------------------------------------- engines
-def resolve_cached_snapshot(model_id):
-    """Find a model in RunPod's cached-models location (Hugging Face cache layout), or None."""
-    org, name = model_id.split("/", 1)
-    root = os.path.join(CACHE_ROOT, f"models--{org}--{name}")
-    refs = os.path.join(root, "refs", "main")
-    snaps = os.path.join(root, "snapshots")
-    if os.path.isfile(refs):
-        p = os.path.join(snaps, open(refs).read().strip())
-        if os.path.isdir(p):
-            return p
-    if os.path.isdir(snaps):
-        for d in sorted(os.listdir(snaps)):
-            p = os.path.join(snaps, d)
-            if os.path.isdir(p):
-                return p
-    return None
-
-
-def pick_model_dir():
-    """Return (directory, source) where source is 'runpod-cache' or 'baked'."""
-    if MODEL_SOURCE not in ("auto", "cache", "baked"):
-        raise RuntimeError(f"VOX_MODEL_SOURCE must be auto, cache or baked (got {MODEL_SOURCE!r})")
-    if MODEL_SOURCE in ("auto", "cache"):
-        p = resolve_cached_snapshot(HF_ID)
-        if p and os.path.exists(os.path.join(p, "config.json")):
-            return p, "runpod-cache"
-        if MODEL_SOURCE == "cache":
-            raise RuntimeError(f"VOX_MODEL_SOURCE=cache but no cached copy of {HF_ID} under {CACHE_ROOT}. "
-                               f"Set the endpoint's 'Model' to {HF_ID} and save.")
-    if os.path.exists(os.path.join(MODEL_DIR, "config.json")):
-        return MODEL_DIR, "baked"
-    raise RuntimeError(f"No model found: nothing baked at {MODEL_DIR} and no RunPod cached copy of {HF_ID}. "
-                       f"Either set the endpoint's 'Model' to {HF_ID}, or build the image with BAKE_MODEL=1.")
-
-
-def prepare_model_dir(src_dir, source):
-    """Return a model directory whose config.json has the requested dtype.
-    Large files are symlinked, so this is instant (no multi-GB copy)."""
-    cfg = json.load(open(os.path.join(src_dir, "config.json")))
-    if cfg.get("dtype") == DTYPE:
-        return src_dir
-    d = f"/tmp/model_{DTYPE}_{source}"
-    os.makedirs(d, exist_ok=True)
-    for name in os.listdir(src_dir):
-        dst = os.path.join(d, name)
-        if name != "config.json" and not os.path.lexists(dst):
-            os.symlink(os.path.join(src_dir, name), dst)
-    cfg["dtype"] = DTYPE
-    with open(os.path.join(d, "config.json"), "w") as f:
-        json.dump(cfg, f, indent=2)
-    return d
-
-
-class RealEngine:
-    def __init__(self):
-        t = time.perf_counter()
-        import torch
-        import check_env
-        check_env.check_package_versions()
-        if torch.cuda.is_available():
-            check_env.check_gpu_kernels()
-        if OPTIMIZE:
-            try:
-                import triton  # noqa: F401
-            except ImportError:
-                raise RuntimeError("VOX_OPTIMIZE=1 needs triton, which this image removes to save about 565 MB. "
-                                   "Rebuild with --build-arg KEEP_TRITON=1, or set VOX_OPTIMIZE=0.")
-        from voxcpm import VoxCPM
-        self.import_s = round(time.perf_counter() - t, 1)
-        self._ref_cache = collections.OrderedDict()
-        self.ref_encodes = 0
-        self.ref_hits = 0
-        self.fast_path = True       # clone mode: reuse an encoded reference
-        self.fast_path_hifi = True  # hifi mode: reuse an encoded reference + transcript
-
-        src_dir, self.source = pick_model_dir()
-        t = time.perf_counter()
-        self.model = VoxCPM.from_pretrained(prepare_model_dir(src_dir, self.source), load_denoiser=False, optimize=OPTIMIZE)
-        self.weights_s = round(time.perf_counter() - t, 1)
-        cls = type(self.model.tts_model).__name__
-        if cls != "VoxCPM2Model":
-            raise RuntimeError(f"Loaded {cls}, expected VoxCPM2Model. Wrong voxcpm version or wrong checkpoint.")
-        self.sr = self.model.tts_model.sample_rate
-        self.gpu = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu"
-        self.versions = check_env.versions()
-        self.arch = (lambda c: f"sm_{c[0]}{c[1]}")(torch.cuda.get_device_capability(0)) if torch.cuda.is_available() else None
-
-    # voxcpm's generate() has no `seed` argument (an earlier version of this handler passed one and would have
-    # failed on any request that set it), so seed the random generators directly.
-    def _seed(self, seed):
-        import torch
-        torch.manual_seed(seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(seed)
-
-    def _get_prompt_cache(self, ref_path, ref_key, prompt_text=None):
-        """Encode a reference clip once and reuse it. model.generate() re-reads and re-encodes the clip on
-        every call; the prompt cache it builds internally is read-only during generation, so it can be shared.
-        Hi-Fi caches are keyed by the transcript too, since the same clip with another transcript differs."""
-        key = (ref_key, hashlib.sha1(prompt_text.encode("utf-8")).hexdigest() if prompt_text else None)
-        if key in self._ref_cache:
-            self._ref_cache.move_to_end(key)
-            self.ref_hits += 1
-            return self._ref_cache[key]
-        kw = {"reference_wav_path": ref_path}
-        if prompt_text:  # Hi-Fi: the clip is also the prompt the model continues from
-            kw.update(prompt_wav_path=ref_path, prompt_text=prompt_text)
-        cache = self.model.tts_model.build_prompt_cache(**kw)
-        self.ref_encodes += 1
-        self._ref_cache[key] = cache
-        while len(self._ref_cache) > REF_CACHE_SIZE:
-            self._ref_cache.popitem(last=False)
-        return cache
-
-    def generate(self, text, steps, cfg, seed, retry, ref_path, ref_key=None, prompt_text=None):
-        """design: no ref_path. clone: ref_path. hifi: ref_path + prompt_text (its exact transcript)."""
-        if seed is not None:
-            self._seed(seed)
-        hifi = bool(ref_path and prompt_text)
-        flag = "fast_path_hifi" if hifi else "fast_path"
-        if ref_path and getattr(self, flag):
-            try:
-                cache = self._get_prompt_cache(ref_path, ref_key or ref_path, prompt_text if hifi else None)
-                clean = re.sub(r"\s+", " ", text.replace("\n", " "))  # same cleanup as VoxCPM.generate()
-                wav, _, _ = self.model.tts_model.generate_with_prompt_cache(
-                    target_text=clean, prompt_cache=cache, min_len=2, max_len=4096,
-                    inference_timesteps=steps, cfg_value=cfg, retry_badcase=retry)
-                return wav.squeeze(0).cpu().numpy()
-            except Exception as e:  # never let an optimisation break synthesis: fall back to the public API
-                setattr(self, flag, False)
-                print(f"{'hifi' if hifi else 'clone'} prompt-cache path failed ({e!r}); "
-                      f"using model.generate() for that mode from now on", flush=True)
-        kw = dict(text=text, cfg_value=cfg, inference_timesteps=steps, retry_badcase=retry)
-        if ref_path:
-            kw["reference_wav_path"] = ref_path
-            if hifi:
-                kw.update(prompt_wav_path=ref_path, prompt_text=prompt_text)
-        return self.model.generate(**kw)
-
-
-class FakeEngine:
-    """Makes tones whose length follows the text. Lets you test the whole request/response
-    pipeline (base64, lesson joining, reference upload, curl scripts) without a GPU."""
-
-    gpu = "fake"
-    sr = 48000
-
-    def __init__(self):
-        self._seen = set()
-        self.ref_encodes = 0
-        self.ref_hits = 0
-        self.fast_path = True
-
-    def generate(self, text, steps, cfg, seed, retry, ref_path, ref_key=None, prompt_text=None):
-        time.sleep(0.05)
-        slow = 1.4 if "slow" in text.lower() else 1.0
-        dur = min(max(0.06 * len(text) * slow, 0.5), 12.0)
-        freq = 220.0
-        if ref_path:
-            key = ref_key or ref_path
-            if key in self._seen:
-                self.ref_hits += 1
-            else:
-                self._seen.add(key)
-                self.ref_encodes += 1
-            with open(ref_path, "rb") as f:
-                freq = 300 + (zlib.crc32(f.read()) % 300)
-            if prompt_text:  # hifi: an octave up, so tests can tell the modes apart
-                freq *= 2
-        elif seed is not None:
-            freq = 200 + (seed % 100)
-        t = np.arange(int(dur * self.sr)) / self.sr
-        return (0.2 * np.sin(2 * np.pi * freq * t)).astype(np.float32)
-
-
-def init_engine():
-    global ENGINE
-    if ENGINE is not None:
-        return ENGINE
-    t0 = time.perf_counter()
-    ENGINE = FakeEngine() if FAKE else RealEngine()
-    STATE["load_s"] = round(time.perf_counter() - t0, 1)
-    STATE["gpu"] = ENGINE.gpu
-    t1 = time.perf_counter()
-    try:
-        ENGINE.generate(WARM_TEXT, 4, 2.0, None, False, None, None)  # first-call overhead happens here, not on a user's job
-    except Exception as e:  # warm-up failure should not kill the worker
-        print("warm-up failed:", repr(e), flush=True)
-    STATE["warmup_s"] = round(time.perf_counter() - t1, 1)
-    STATE["boot_s"] = round(time.perf_counter() - _T0, 1)
-    print(f"engine ready: import {getattr(ENGINE, 'import_s', None)}s, weights {getattr(ENGINE, 'weights_s', None)}s "
-          f"({getattr(ENGINE, 'source', None)}), warm-up {STATE['warmup_s']}s, boot-to-ready {STATE['boot_s']}s, "
-          f"gpu {STATE['gpu']}, dtype {DTYPE}", flush=True)
-    return ENGINE
-
-
-def worker_info():
-    return {
-        "gpu": STATE["gpu"], "dtype": DTYPE, "optimize": OPTIMIZE, "fake": FAKE,
-        "model_load_s": STATE["load_s"], "warmup_s": STATE["warmup_s"], "jobs_served": STATE["jobs"],
-        "gpu_arch": getattr(ENGINE, "arch", None), **getattr(ENGINE, "versions", {}),
-        "model_source": getattr(ENGINE, "source", None), "import_s": getattr(ENGINE, "import_s", None),
-        "weights_s": getattr(ENGINE, "weights_s", None), "boot_to_ready_s": STATE.get("boot_s"),
-        "ref_encodes": getattr(ENGINE, "ref_encodes", None), "ref_cache_hits": getattr(ENGINE, "ref_hits", None),
-        "prompt_cache_path": getattr(ENGINE, "fast_path", None),
-        "prompt_cache_path_hifi": getattr(ENGINE, "fast_path_hifi", None),
-    }
-
-
-def diagnostics():
-    """Shown only in ping responses: why a model source was or wasn't picked."""
-    def ls(p, n=12):
-        try:
-            return sorted(os.listdir(p))[:n]
-        except Exception:
-            return None
-    try:
-        snap = resolve_cached_snapshot(HF_ID)
-    except Exception as e:
-        snap = f"error: {e}"
-    return {
-        "source_setting": MODEL_SOURCE, "hf_id": HF_ID, "cache_root": CACHE_ROOT,
-        "cache_root_exists": os.path.isdir(CACHE_ROOT), "cache_entries": ls(CACHE_ROOT),
-        "runpod_volume_entries": ls("/runpod-volume"), "resolved_snapshot": snap,
-        "baked_exists": os.path.exists(os.path.join(MODEL_DIR, "config.json")),
-    }
+class RequestError(ValueError):
+    """Bad input. Reported to the caller; the worker stays healthy."""
 
 
 # --------------------------------------------------------------------------- helpers
-def clamp(v, lo, hi):
-    try:
-        v = float(v)
-    except (TypeError, ValueError):
-        raise UserError(f"Expected a number between {lo} and {hi}, got {v!r}")
-    return max(lo, min(hi, v))
+class Params:
+    """Keyword arguments a callable accepts; **kwargs (or no signature) accepts all."""
 
-
-def sniff_ext(raw: bytes) -> str:
-    if raw[:4] == b"RIFF": return ".wav"
-    if raw[:4] == b"fLaC": return ".flac"
-    if raw[:4] == b"OggS": return ".ogg"
-    if raw[:3] == b"ID3" or raw[:2] in (b"\xff\xfb", b"\xff\xf3", b"\xff\xf2"): return ".mp3"
-    return ".wav"
-
-
-def write_reference(b64: str):
-    """Returns (temp file path, content hash). The hash lets the engine reuse the encoded reference."""
-    try:
-        raw = base64.b64decode(b64)
-    except Exception:
-        raise UserError("reference_b64 is not valid base64")
-    if not raw:
-        raise UserError("reference_b64 is empty")
-    if len(raw) > MAX_REF_BYTES:
-        raise UserError(f"reference clip too large ({len(raw)} bytes, max {MAX_REF_BYTES})")
-    fd, path = tempfile.mkstemp(suffix=sniff_ext(raw))
-    with os.fdopen(fd, "wb") as f:
-        f.write(raw)
-    return path, hashlib.sha1(raw).hexdigest()
-
-
-def fetch_reference(url: str, ref_id: str, version: str):
-    """Download a reference clip from a presigned URL. Returns (path, cache key, was_cached).
-    Files stay in REF_DIR and are reused while (reference_id, reference_version) is unchanged."""
-    import urllib.parse, urllib.request
-    u = urllib.parse.urlparse(url)
-    if u.scheme != "https" and not (REF_ALLOW_HTTP and u.scheme == "http"):
-        raise UserError("reference_url must be https")
-    host = (u.hostname or "").lower()
-    if REF_HOSTS and not any(host == h.lstrip(".") or host.endswith(h if h.startswith(".") else "." + h) for h in REF_HOSTS):
-        raise UserError("reference_url host is not allowed")
-    safe = re.sub(r"[^\w\-]+", "_", ref_id or "ref", flags=re.UNICODE)[:60] or "ref"
-    ident = hashlib.sha1(f"{ref_id}|{version}".encode("utf-8")).hexdigest()[:16] if (ref_id or version) else hashlib.sha1(url.split("?")[0].encode()).hexdigest()[:16]
-    os.makedirs(REF_DIR, exist_ok=True)
-    path = os.path.join(REF_DIR, f"{safe}-{ident}.wav")
-    key = f"url:{ident}"
-    if os.path.exists(path) and os.path.getsize(path) > 0:
-        return path, key, True
-    try:
-        with urllib.request.urlopen(url, timeout=REF_DOWNLOAD_TIMEOUT_S) as r:
-            if r.status != 200:
-                raise UserError(f"reference download failed (HTTP {r.status})")
-            raw = r.read(MAX_REF_BYTES + 1)
-    except UserError:
-        raise
-    except Exception as e:
-        raise UserError(f"reference download failed: {type(e).__name__}")
-    if not raw:
-        raise UserError("reference download was empty")
-    if len(raw) > MAX_REF_BYTES:
-        raise UserError(f"reference clip too large (max {MAX_REF_BYTES} bytes)")
-    tmp = path + ".part"
-    with open(tmp, "wb") as f:
-        f.write(raw)
-    os.replace(tmp, path)
-    files = sorted((os.path.join(REF_DIR, n) for n in os.listdir(REF_DIR) if n.endswith(".wav")), key=os.path.getmtime)
-    for old in files[:-20]:
-        try: os.remove(old)
-        except OSError: pass
-    return path, key, False
-
-
-def split_script(script: str):
-    parts = re.split(r"(?<=[။.!?])\s*", script.strip())
-    return [p.strip() for p in parts if p and p.strip()]
-
-
-def encode(wav: np.ndarray, sr: int, out_sr):
-    """float32 mono -> (base64 16-bit WAV, sample_rate, duration_s)."""
-    wav = np.asarray(wav, dtype=np.float32).reshape(-1)
-    if out_sr and int(out_sr) != sr:
-        import librosa
-        wav = librosa.resample(wav, orig_sr=sr, target_sr=int(out_sr))
-        sr = int(out_sr)
-    wav = np.clip(wav, -1.0, 1.0)
-    buf = io.BytesIO()
-    sf.write(buf, wav, sr, format="WAV", subtype="PCM_16")
-    return base64.b64encode(buf.getvalue()).decode("ascii"), sr, round(len(wav) / sr, 3)
-
-
-def parse_params(inp):
-    style = str(inp.get("style") or "").strip().strip("() ")
-    seed = inp.get("seed")
-    if seed is None and DEFAULT_SEED:
-        seed = DEFAULT_SEED
-    if seed is not None:
+    def __init__(self, fn):
         try:
-            seed = int(seed)
+            sig = inspect.signature(fn)
+            self.names = set(sig.parameters)
+            self.var_kw = any(p.kind is inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+            self.text = str(sig)
         except (TypeError, ValueError):
-            raise UserError("seed must be an integer")
-    out_sr = inp.get("out_sample_rate")
-    if out_sr is not None:
-        out_sr = int(clamp(out_sr, 8000, 48000))
-    mode = str(inp.get("mode") or "").strip().lower() or None
-    if mode is not None and mode not in MODES:
-        raise UserError(f"mode must be one of {', '.join(MODES)} (got {inp.get('mode')!r})")
-    prompt_text = inp.get("prompt_text") or inp.get("reference_text")
-    if prompt_text is not None:
-        prompt_text = re.sub(r"\s+", " ", str(prompt_text)).strip() or None
-        if prompt_text and len(prompt_text) > MAX_PROMPT_TEXT_CHARS:
-            raise UserError(f"prompt_text is {len(prompt_text)} characters; max is {MAX_PROMPT_TEXT_CHARS}")
-    return {
-        "mode": mode,
-        "prompt_text": prompt_text,
-        "style": style,
-        "steps": int(clamp(inp.get("steps", 10), 2, 30)),
-        "cfg": float(clamp(inp.get("cfg", DEFAULT_CFG), 0.5, 5.0)),
-        "seed": seed,
-        "retry": bool(inp.get("retry_badcase", False)),
-        "gap": float(clamp(inp.get("gap_s", 0.7), 0.0, 3.0)),
-        "out_sr": out_sr,
-        "return_clips": bool(inp.get("return_clips", True)),
-    }
+            self.names, self.var_kw, self.text = set(), True, "<signature unavailable>"
+
+    def __contains__(self, name):
+        return self.var_kw or name in self.names
 
 
-def check_sentence(s, where="text"):
-    if not isinstance(s, str) or not s.strip():
-        raise UserError(f"{where} must be a non-empty string")
-    if len(s) > MAX_CHARS:
-        raise UserError(f"{where} is {len(s)} characters; max is {MAX_CHARS}. Split it into shorter sentences.")
-    return s.strip()
+def resolve_model_dir() -> str:
+    """Prefer RunPod's cached-model mount (no download, not billed); fall back to Hub."""
+    if os.path.isdir(MODEL_ID):
+        return MODEL_ID
+    from huggingface_hub import snapshot_download
 
-
-def resolve_mode(p, has_ref, n_sentences):
-    """Pick the generation mode before any reference is downloaded. Returns (mode, use_ref, warnings).
-    Without an explicit mode the behaviour is the original one: clone with a reference, else design."""
-    warnings = []
-    mode = p["mode"] or ("clone" if has_ref else "design")
-    if mode in ("clone", "hifi") and not has_ref:
-        raise UserError(f"mode '{mode}' needs a reference voice (reference_url or reference_b64)")
-    if mode == "hifi" and not p["prompt_text"]:
-        raise UserError("mode 'hifi' needs prompt_text: the exact transcript of the reference clip")
-    if mode == "design" and has_ref:
-        warnings.append("reference ignored in design mode")
-    if mode != "hifi" and p["prompt_text"]:
-        warnings.append(f"prompt_text ignored in {mode} mode (only hifi uses it)")
-    if mode == "hifi" and p["style"]:
-        warnings.append("style ignored in hifi mode")
-    if mode == "design" and n_sentences > 1 and p["seed"] is None:
-        warnings.append("design mode without a seed: each sentence may get a different voice; send a seed")
-    return mode, mode in ("clone", "hifi"), warnings
-
-
-def synth(text, p, ref_path, ref_key=None, mode="clone"):
-    style = p["style"] if mode != "hifi" else ""   # VoxCPM ignores control instructions in hifi
-    t = f"({style}){text}" if style else text
-    prompt_text = p["prompt_text"] if mode == "hifi" else None
-    t0 = time.perf_counter()
-    wav = ENGINE.generate(t, p["steps"], p["cfg"], p["seed"], p["retry"], ref_path, ref_key, prompt_text)
-    return np.asarray(wav, dtype=np.float32).reshape(-1), time.perf_counter() - t0
-
-
-# --------------------------------------------------------------------------- sieng web app mode
-OUT_URL_TTL_S = int(os.environ.get("VOX_OUT_URL_TTL_S", "3600"))
-_S3 = {"client": None}
-
-
-def _r2():
-    """boto3 client for R2 (created once). Needs the R2_* environment variables."""
-    if _S3["client"] is None:
-        env = lambda k: (os.environ.get(k) or "").strip()  # copy-pasted values often carry a trailing space or newline
-        acct, key, secret = env("R2_ACCOUNT_ID"), env("R2_ACCESS_KEY_ID"), env("R2_SECRET_ACCESS_KEY")
-        endpoint = env("R2_ENDPOINT") or (f"https://{acct}.r2.cloudflarestorage.com" if acct else "")
-        if not (endpoint and key and secret and env("R2_BUCKET_NAME")):
-            raise UserError("R2 is not configured on the worker: set R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY and R2_BUCKET_NAME")
-        import boto3
-        from botocore.config import Config
-        _S3["client"] = boto3.client("s3", endpoint_url=endpoint, aws_access_key_id=key, aws_secret_access_key=secret,
-                                     region_name="auto", config=Config(signature_version="s3v4", s3={"addressing_style": "path"}))
-    return _S3["client"]
-
-
-def _safe_part(v, default):
-    v = re.sub(r"[^\w\-]", "_", str(v or ""), flags=re.UNICODE).strip("_")
-    return (v or default)[:80]
-
-
-def _output_key(k):
-    """body.output_key: where the app wants the clip in R2 (for example <account>/<project>/audios/<line>.wav).
-    Must be a plain relative .wav path; anything odd is ignored and the default outputs/... key is used."""
-    if not isinstance(k, str) or not (3 < len(k) <= 400) or not k.endswith(".wav"):
-        return None
-    if k.startswith("/") or "\\" in k or ".." in k.split("/") or any(ord(c) < 32 for c in k) or "//" in k:
-        return None
-    return k
-
-def _speed_hint(speed):
-    try:
-        sp = float(speed)
-    except (TypeError, ValueError):
-        return ""
-    if sp < 0.85:
-        return "speaking slowly"
-    if sp > 1.3:
-        return "speaking fast"
-    if sp > 1.1:
-        return "speaking a little faster"
-    return ""
-
-
-def chunk_for_tts(text, limit=None, max_chunks=None):
-    """Split long text into pieces the model can take: sentence by sentence (newlines and ။ . ! ? end a sentence),
-    over-long sentences are cut at a comma or space, and if there would be too many pieces, neighbours are merged."""
-    limit = limit or MAX_CHARS
-    max_chunks = max_chunks or MAX_SENTENCES
-    sentences = [x.strip() for ln in re.split(r"[\r\n]+", str(text)) for x in split_script(ln) if x.strip()]
-    pieces = []
-    for sent in sentences:
-        while len(sent) > limit:
-            cut = max(sent.rfind(c, 0, limit) for c in ("၊", ",", " ", "\u200b"))
-            cut = cut + 1 if cut > limit // 3 else limit
-            pieces.append(sent[:cut].strip())
-            sent = sent[cut:].strip()
-        if sent:
-            pieces.append(sent)
-    while len(pieces) > max_chunks:  # merge the neighbouring pair with the shortest total
-        best = min((i for i in range(len(pieces) - 1) if len(pieces[i]) + len(pieces[i + 1]) + 1 <= limit),
-                   key=lambda i: len(pieces[i]) + len(pieces[i + 1]), default=None)
-        if best is None:
-            raise UserError(f"Text is too long: {sum(map(len, pieces))} characters in {len(pieces)} parts; "
-                            f"the limit is {max_chunks} parts of {limit} characters. Send it in smaller pieces.")
-        pieces[best:best + 2] = [pieces[best] + " " + pieces[best + 1]]
-    return pieces
-
-
-def _handle_sieng(inp):
-    path = str(inp.get("path") or "")
-    if str(inp.get("method", "POST")).upper() != "POST" or path.rstrip("/") not in ("/api/generate", "/generate"):
-        raise UserError(f"Unsupported route: {inp.get('method')} {path}")
-    b = inp.get("body")
-    if not isinstance(b, dict) or not str(b.get("text") or "").strip():
-        raise UserError("body.text is required")
-    style = str(b.get("style") or "").strip()
-    hint = _speed_hint(b.get("speed"))
-    if hint:
-        style = f"{style}, {hint}" if style else hint
-    flat = {"text": b["text"], "style": style}
-    print(f"sieng request: mode={b.get('mode') or 'auto'} voice={b.get('reference_id')!r} style={style!r} speed={b.get('speed')!r} chars={len(str(b['text']))} seed={b.get('seed', DEFAULT_SEED or None)!r} cfg={b.get('cfg', DEFAULT_CFG)!r}", flush=True)  # shows in the RunPod log
-    for k in ("reference_url", "reference_id", "reference_version", "reference_b64", "steps", "cfg", "seed",
-              "mode", "prompt_text", "reference_text"):
-        if b.get(k) not in (None, ""):
-            flat[k] = b[k]
-    if b.get("reference_id") and str(b.get("mode") or "").lower() != "design" \
-            and not (flat.get("reference_url") or flat.get("reference_b64")):
-        raise UserError(f"No reference_url was sent for voice '{b['reference_id']}'")
-    chunks = chunk_for_tts(b["text"])
-    if not chunks:
-        raise UserError("body.text is empty")
-    if len(chunks) == 1:
-        out = _handle({"input": {**flat, "text": chunks[0]}})
-        audio_b64 = out["audio_b64"]
-    else:  # long text: generate piece by piece and join with a short pause
-        out = _handle({"input": {**flat, "sentences": chunks, "gap_s": 0.35, "return_clips": False}})
-        audio_b64 = out["joined_b64"]
-    wav_bytes = base64.b64decode(audio_b64)
-    process_id = _safe_part(b.get("process_id"), f"p{int(time.time() * 1000)}")
-    key = _output_key(b.get("output_key")) or f"outputs/{_safe_part(b.get('group_id'), 'anon')}/{_safe_part(b.get('project_id'), 'none')}/{process_id}.wav"
-    s3, bucket = _r2(), os.environ["R2_BUCKET_NAME"].strip()
-    try:
-        s3.put_object(Bucket=bucket, Key=key, Body=wav_bytes, ContentType="audio/wav")
-    except Exception as e:  # botocore ClientError, endpoint errors, ...
-        code = getattr(e, "response", {}).get("Error", {}).get("Code") if hasattr(e, "response") else None
-        hint = {"Unauthorized": "the R2 key is rejected: it must be an R2 API token's Access Key ID and Secret (not the Cloudflare API token value) with Object Read & Write on this bucket",
-                "AccessDenied": "the R2 token has no write permission on this bucket",
-                "NoSuchBucket": "R2_BUCKET_NAME does not exist in this account",
-                "InvalidAccessKeyId": "R2_ACCESS_KEY_ID is wrong", "SignatureDoesNotMatch": "R2_SECRET_ACCESS_KEY is wrong"}.get(code, "check the R2_* settings and R2_ENDPOINT (EU buckets need the .eu.r2.cloudflarestorage.com endpoint)")
-        raise UserError(f"R2 upload failed ({code or type(e).__name__}): {hint}")
-    url = s3.generate_presigned_url("get_object", Params={"Bucket": bucket, "Key": key}, ExpiresIn=OUT_URL_TTL_S)
-    # RunPod wraps this dict as {"output": {...}}, which is where the web app reads audio_url and process_id.
-    return {"audio_url": url, "process_id": b.get("process_id") or process_id, "key": key,
-            "duration_s": out["duration_s"], "gen_s": out["gen_s"], "parts": len(chunks),
-            "reference_cached": out.get("reference_cached"), "mode": out.get("mode"),
-            "warnings": out.get("warnings", [])}
-
-
-# --------------------------------------------------------------------------- handler
-def _handle(job):
-    init_engine()
-    inp = job.get("input") or {}
-    if not isinstance(inp, dict):
-        raise UserError("'input' must be a JSON object")
-
-    if "method" in inp and "path" in inp:
-        return _handle_sieng(inp)
-
-    if str(inp.get("action", "")).lower() == "ping":
-        return {"ok": True, "worker": worker_info(), "diagnostics": diagnostics()}
-
-    p = parse_params(inp)
-    if "sentences" in inp:
-        sentences = inp["sentences"]
-        if not isinstance(sentences, list) or not sentences:
-            raise UserError("'sentences' must be a non-empty list of strings")
-        lesson = True
-    elif "script" in inp:
-        sentences = split_script(str(inp["script"]))
-        if not sentences:
-            raise UserError("'script' is empty")
-        lesson = True
-    elif "text" in inp:
-        sentences = [inp["text"]]
-        lesson = False
+    if os.path.isdir(RUNPOD_HF_CACHE):
+        try:
+            path = snapshot_download(MODEL_ID, cache_dir=RUNPOD_HF_CACHE, local_files_only=True)
+            log(f"Model from RunPod cache: {path}")
+            return path
+        except Exception as e:  # noqa: BLE001
+            log(f"{MODEL_ID} not in RunPod cache ({type(e).__name__}); downloading instead")
     else:
-        raise UserError("Provide 'text', 'script' or 'sentences' (or action 'ping').")
+        log("No RunPod model cache mounted; downloading. Set the endpoint's Model field to avoid this.")
+    return snapshot_download(MODEL_ID)
 
-    if len(sentences) > MAX_SENTENCES:
-        raise UserError(f"{len(sentences)} sentences; max per request is {MAX_SENTENCES}")
-    sentences = [check_sentence(s, f"sentence {i + 1}") for i, s in enumerate(sentences)]
 
-    has_ref = bool(inp.get("reference_url") or inp.get("reference_b64"))
-    mode, use_ref, warnings = resolve_mode(p, has_ref, len(sentences))
+def find_sample_rates(obj, path=""):
+    found = []
+    if isinstance(obj, dict):
+        for key, val in obj.items():
+            p = f"{path}.{key}" if path else key
+            if isinstance(val, (int, float)) and ("sample_rate" in key.lower() or "sampling_rate" in key.lower()):
+                found.append((p, int(val)))
+            else:
+                found.extend(find_sample_rates(val, p))
+    elif isinstance(obj, list):
+        for i, val in enumerate(obj):
+            found.extend(find_sample_rates(val, f"{path}[{i}]"))
+    return found
 
-    STATE["jobs"] += 1
-    ref_path, ref_key, ref_owned, ref_source, ref_cached = None, None, False, None, None
-    if not use_ref:
-        pass  # design mode: don't download or decode a reference we won't use
-    elif inp.get("reference_url"):
-        ref_path, ref_key, ref_cached = fetch_reference(str(inp["reference_url"]), str(inp.get("reference_id") or ""), str(inp.get("reference_version") or ""))
-        ref_source = "url"
-    elif inp.get("reference_b64"):
-        ref_path, ref_key = write_reference(inp["reference_b64"])
-        ref_owned, ref_source = True, "b64"
+
+def detect_sample_rate(model_dir: str) -> int:
+    if os.getenv("SAMPLE_RATE"):
+        return int(os.environ["SAMPLE_RATE"])
+    found = find_sample_rates(json.loads((Path(model_dir) / "config.json").read_text()))
+    for hint in ("out", "decode"):
+        for p, v in found:
+            if hint in p.lower().split(".")[-1]:
+                return v
+    if not found:
+        raise RuntimeError("No sample rate in config.json; set the SAMPLE_RATE env var.")
+    return max(v for _, v in found)  # VoxCPM2 encodes at 16 kHz, decodes higher
+
+
+def split_text(text: str, max_chars: int) -> list[str]:
+    """Split long text at sentence ends (Burmese ။ included), packing up to max_chars."""
+    if len(text) <= max_chars:
+        return [text]
+    parts = [p.strip() for p in re.split(r"(?<=[။!?！？。])\s*|(?<=\.)\s+", text) if p and p.strip()]
+    segs, cur = [], ""
+    for p in parts:
+        while len(p) > max_chars:  # one very long sentence: break at a space if possible
+            cut = p.rfind(" ", 0, max_chars)
+            cut = cut if cut > max_chars // 2 else max_chars
+            if cur:
+                segs.append(cur)
+                cur = ""
+            segs.append(p[:cut].strip())
+            p = p[cut:].strip()
+        if not p:
+            continue
+        if cur and len(cur) + 1 + len(p) > max_chars:
+            segs.append(cur)
+            cur = p
+        else:
+            cur = f"{cur} {p}" if cur else p
+    if cur:
+        segs.append(cur)
+    return segs
+
+
+def join_segments(wavs: list[np.ndarray], sr: int) -> np.ndarray:
+    wavs = [w for w in wavs if w.size]
+    if len(wavs) <= 1:
+        return wavs[0] if wavs else np.zeros(0, dtype=np.float32)
+    gap = np.zeros(int(SEGMENT_GAP_S * sr), dtype=np.float32)
+    out = []
+    for i, w in enumerate(wavs):
+        if i:
+            out.append(gap)
+        out.append(w)
+    return np.concatenate(out)
+
+
+def encode_audio(wav: np.ndarray, sr: int, fmt: str) -> str:
+    buf = io.BytesIO()
+    sf.write(buf, np.clip(wav, -1.0, 1.0), sr, format=fmt.upper(), subtype="PCM_16")
+    return base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+# --------------------------------------------------------------------------- requests
+@dataclass
+class TTSRequest:
+    text: str
+    mode: str
+    instruction: str
+    ref_bytes: bytes | None
+    ref_suffix: str
+    prompt_text: str | None
+    cfg_value: float
+    inference_timesteps: int
+    output_format: str
+    split: bool
+    warnings: list = field(default_factory=list)
+
+
+def list_voices() -> list[str]:
+    if not VOICES_DIR.is_dir():
+        return []
+    return sorted({p.stem for p in VOICES_DIR.iterdir() if p.suffix.lower() in AUDIO_EXTS})
+
+
+def load_voice(name: str):
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", name):
+        raise RequestError("voice names may only contain letters, digits, '_' and '-'")
+    for ext in AUDIO_EXTS:
+        p = VOICES_DIR / f"{name}{ext}"
+        if p.exists():
+            txt = VOICES_DIR / f"{name}.txt"
+            transcript = txt.read_text(encoding="utf-8").strip() if txt.exists() else None
+            return p.read_bytes(), ext, transcript
+    raise RequestError(f"unknown voice '{name}'; available: {list_voices() or 'none'}")
+
+
+def fetch_url(url: str):
+    if not ALLOW_REF_URL:
+        raise RequestError("reference_audio_url is disabled on this endpoint")
+    if not url.startswith(("https://", "http://")):
+        raise RequestError("reference_audio_url must be http(s)")
+    req = urllib.request.Request(url, headers={"User-Agent": "voxcpm-runpod"})
     try:
-        sr = ENGINE.sr
-        clips, wavs, total_gen = [], [], 0.0
-        for i, s in enumerate(sentences, 1):
-            wav, secs = synth(s, p, ref_path, ref_key, mode)
-            wavs.append(wav)
-            total_gen += secs
-            b64, out_sr, dur = encode(wav, sr, p["out_sr"])
-            clips.append({"index": i, "text": s, "audio_b64": b64, "duration_s": dur, "gen_s": round(secs, 3)})
-    finally:
-        if ref_owned and ref_path and os.path.exists(ref_path):
-            os.remove(ref_path)
+        with urllib.request.urlopen(req, timeout=30) as r:
+            data = r.read(MAX_REF_BYTES + 1)
+    except Exception as e:  # noqa: BLE001
+        raise RequestError(f"could not download reference audio: {e}") from e
+    if len(data) > MAX_REF_BYTES:
+        raise RequestError(f"reference audio larger than {MAX_REF_BYTES // 2**20} MB")
+    suffix = Path(urllib.parse.urlparse(url).path).suffix.lower()
+    return data, suffix if suffix in AUDIO_EXTS else ".wav"
 
-    total_audio = sum(len(w) for w in wavs) / sr
-    out = {
-        "sample_rate": p["out_sr"] or sr,
-        "gen_s": round(total_gen, 3),
-        "duration_s": round(total_audio, 3),
-        "wait_per_audio": round(total_gen / total_audio, 3) if total_audio else None,
-        "mode": mode,
-        "params": {k: p[k] for k in ("style", "steps", "cfg", "seed", "retry", "out_sr")},
-        "used_reference": ref_path is not None,
-        "reference_source": ref_source,
-        "reference_cached": ref_cached,
-        "warnings": warnings,
-        "worker": worker_info(),
-    }
-    if not lesson:
-        out["audio_b64"] = clips[0]["audio_b64"]
+
+def check_reference(data: bytes, warnings: list):
+    try:
+        info = sf.info(io.BytesIO(data))
+    except Exception as e:  # noqa: BLE001
+        raise RequestError(f"reference audio is not a readable audio file: {e}") from e
+    if info.duration > MAX_REF_SECONDS:
+        raise RequestError(f"reference audio is {info.duration:.0f}s; max {MAX_REF_SECONDS:.0f}s")
+    if not 5 <= info.duration <= 30:
+        warnings.append(f"reference audio is {info.duration:.1f}s; 5-30 s gives the most stable cloning")
+
+
+def parse_request(inp: dict) -> TTSRequest:
+    warnings: list[str] = []
+    text = str(inp.get("text", "")).strip()
+    if not text:
+        raise RequestError("'text' is required")
+    if len(text) > MAX_TEXT_CHARS:
+        raise RequestError(f"'text' is {len(text)} characters; max {MAX_TEXT_CHARS}")
+
+    ref_bytes, ref_suffix = None, ".wav"
+    prompt_text = inp.get("prompt_text")
+    if inp.get("voice"):
+        ref_bytes, ref_suffix, voice_txt = load_voice(str(inp["voice"]))
+        prompt_text = prompt_text or voice_txt
+    elif inp.get("reference_audio_base64"):
+        try:
+            ref_bytes = base64.b64decode(inp["reference_audio_base64"], validate=True)
+        except Exception as e:  # noqa: BLE001
+            raise RequestError("reference_audio_base64 is not valid base64") from e
+        if len(ref_bytes) > MAX_REF_BYTES:
+            raise RequestError(f"reference audio larger than {MAX_REF_BYTES // 2**20} MB")
+        ref_suffix = "." + str(inp.get("reference_audio_format", "wav")).lower().lstrip(".")
+    elif inp.get("reference_audio_url"):
+        ref_bytes, ref_suffix = fetch_url(str(inp["reference_audio_url"]))
+    if ref_bytes is not None:
+        check_reference(ref_bytes, warnings)
+
+    mode = str(inp.get("mode") or ("clone" if ref_bytes else "design")).lower()
+    if mode not in MODES:
+        raise RequestError(f"'mode' must be one of {MODES}")
+    if mode in ("clone", "hifi") and ref_bytes is None:
+        raise RequestError(f"mode '{mode}' needs 'voice', 'reference_audio_base64' or 'reference_audio_url'")
+    if mode == "hifi" and not prompt_text:
+        raise RequestError("mode 'hifi' needs 'prompt_text' (exact transcript of the reference audio)")
+    if mode == "design" and ref_bytes is not None:
+        warnings.append("reference audio ignored in design mode")
+        ref_bytes = None
+
+    instruction = str(inp.get("instruction") or "").strip()
+    if instruction and not instruction.startswith("("):
+        instruction = f"({instruction})"
+    if mode == "hifi" and instruction:
+        warnings.append("instruction ignored in hifi mode")
+        instruction = ""
+
+    try:
+        cfg = float(inp.get("cfg_value", 2.0))
+        steps = int(inp.get("inference_timesteps", 10))
+    except (TypeError, ValueError) as e:
+        raise RequestError("cfg_value must be a number and inference_timesteps an integer") from e
+    if not 0.5 <= cfg <= 5.0:
+        raise RequestError("cfg_value must be between 0.5 and 5.0 (typical 1.0-3.0)")
+    if not 1 <= steps <= 50:
+        raise RequestError("inference_timesteps must be between 1 and 50 (recommended 4-30)")
+
+    fmt = str(inp.get("output_format", "wav")).lower()
+    if fmt not in OUTPUT_FORMATS:
+        raise RequestError(f"output_format must be one of {OUTPUT_FORMATS}")
+
+    split = bool(inp.get("split_long_text", True))
+    if split and mode == "design" and len(text) > MAX_SEGMENT_CHARS:
+        # Each design call invents a new voice, so segments would not match.
+        warnings.append("long text not split in design mode (voice would change per segment); "
+                        "use clone/hifi for long text")
+        split = False
+
+    return TTSRequest(text=text, mode=mode, instruction=instruction, ref_bytes=ref_bytes,
+                      ref_suffix=ref_suffix, prompt_text=prompt_text, cfg_value=cfg,
+                      inference_timesteps=steps, output_format=fmt, split=split, warnings=warnings)
+
+
+# --------------------------------------------------------------------------- smoke test
+SMOKE_CODE = r"""
+import json, os, torch
+import torch.nn.functional as F
+cap = torch.cuda.get_device_capability(0)
+name = torch.cuda.get_device_name(0)
+arch = os.environ.get("FLASH_ATTN_ARCH", "")
+archs = [int(a) for a in arch.replace(";", " ").replace("-", " ").split() if a.isdigit()]
+if archs and cap[0] not in {a // 10 for a in archs}:   # sm_80 kernels run on all 8.x GPUs, etc.
+    print(json.dumps({"ok": False, "error": f"image built for sm_{arch}, but {name} is sm_{cap[0]}{cap[1]}; "
+                      f"use an image tag that includes sm_{cap[0]}0 or restrict the endpoint's GPU types"}))
+    raise SystemExit(0)
+from flash_attn import flash_attn_varlen_func
+torch.manual_seed(0)
+n, h, d = 256, 8, 64
+q, k, v = (torch.randn(n, h, d, device="cuda", dtype=torch.bfloat16) for _ in range(3))
+cu = torch.tensor([0, n], dtype=torch.int32, device="cuda")
+out = flash_attn_varlen_func(q, k, v, cu, cu, n, n, causal=True)
+ref = F.scaled_dot_product_attention(q.transpose(0, 1)[None], k.transpose(0, 1)[None],
+                                     v.transpose(0, 1)[None], is_causal=True)[0].transpose(0, 1)
+err = (out - ref).abs().max().item()
+print(json.dumps({"ok": err < 0.05, "gpu": name, "capability": list(cap), "max_err": err}))
+"""
+
+
+def run_smoke_test():
+    """Run in a subprocess so its CUDA context is released before the engine starts."""
+    t = time.perf_counter()
+    r = subprocess.run([sys.executable, "-c", SMOKE_CODE], capture_output=True, text=True, timeout=300)
+    lines = [ln for ln in r.stdout.strip().splitlines() if ln.startswith("{")]
+    if r.returncode != 0 or not lines:
+        raise RuntimeError(f"flash-attn smoke test crashed:\n{r.stderr[-2000:]}")
+    res = json.loads(lines[-1])
+    if not res.get("ok"):
+        raise RuntimeError(f"flash-attn smoke test failed: {res}")
+    log(f"flash-attn smoke test OK in {time.perf_counter() - t:.1f}s: {res}")
+
+
+# --------------------------------------------------------------------------- engines
+class NanoEngine:
+    name = "nano"
+
+    def __init__(self):
+        self.server = None
+        self.sample_rate = 0
+        self.latents: OrderedDict[str, object] = OrderedDict()
+
+    async def start(self):
+        if SMOKE_TEST:
+            await asyncio.to_thread(run_smoke_test)
+        model_dir = await asyncio.to_thread(resolve_model_dir)
+        self.sample_rate = detect_sample_rate(model_dir)
+        from nanovllm_voxcpm import VoxCPM
+
+        # Called inside the running event loop -> returns the async server pool.
+        self.server = VoxCPM.from_pretrained(
+            model=model_dir, devices=[0], max_num_seqs=MAX_NUM_SEQS, gpu_memory_utilization=GPU_MEM_UTIL
+        )
+        ready = getattr(self.server, "wait_for_ready", None)
+        if ready:
+            await ready()
+        self.params = Params(self.server.generate)
+        log(f"nano generate{self.params.text}")
+        enc = getattr(self.server, "encode_latents", None)
+        log(f"nano encode_latents{Params(enc).text if enc else ': MISSING (clone/hifi unavailable)'}")
+        log(f"sample rate {self.sample_rate} Hz")
+
+    async def _encode(self, data: bytes, suffix: str):
+        fn = getattr(self.server, "encode_latents", None)
+        if fn is None:
+            raise RequestError("this nanovllm-voxcpm version cannot encode reference audio")
+        fmt = suffix.lstrip(".") or "wav"
+        errors = []
+        for desc, args in (("bytes, format", (data, fmt)), ("bytes", (data,))):
+            try:
+                res = fn(*args)
+                return await res if inspect.isawaitable(res) else res
+            except Exception as e:  # noqa: BLE001 - try the next call shape
+                errors.append(f"{desc}: {type(e).__name__}: {e}")
+        fd, path = tempfile.mkstemp(suffix=suffix)
+        try:
+            os.write(fd, data)
+            os.close(fd)
+            res = fn(path)
+            return await res if inspect.isawaitable(res) else res
+        except Exception as e:  # noqa: BLE001
+            errors.append(f"path: {type(e).__name__}: {e}")
+        finally:
+            os.unlink(path)
+        raise RuntimeError("encode_latents failed:\n  " + "\n  ".join(errors))
+
+    async def latents_for(self, data: bytes, suffix: str):
+        key = hashlib.sha256(data).hexdigest()
+        if key in self.latents:
+            self.latents.move_to_end(key)
+            return self.latents[key], True
+        lat = await self._encode(data, suffix)
+        self.latents[key] = lat
+        while len(self.latents) > LATENT_CACHE_SIZE:
+            self.latents.popitem(last=False)
+        return lat, False
+
+    async def _generate(self, text: str, kw: dict) -> np.ndarray:
+        chunks = []
+        async for chunk in self.server.generate(target_text=text, **kw):
+            chunks.append(np.asarray(chunk, dtype=np.float32).reshape(-1))
+        return np.concatenate(chunks) if chunks else np.zeros(0, dtype=np.float32)
+
+    async def synthesize(self, req: TTSRequest):
+        kw = {k: v for k, v in {"cfg_value": req.cfg_value,
+                                "inference_timesteps": req.inference_timesteps}.items() if k in self.params}
+        info = {}
+        if req.mode != "design":
+            need = ["ref_audio_latents"] + (["prompt_latents", "prompt_text"] if req.mode == "hifi" else [])
+            missing = [n for n in need if n not in self.params]
+            if missing:
+                raise RequestError(f"engine 'nano' does not support mode '{req.mode}' (missing {missing})")
+            lat, hit = await self.latents_for(req.ref_bytes, req.ref_suffix)
+            info["reference_cache_hit"] = hit
+            kw["ref_audio_latents"] = lat
+            if req.mode == "hifi":
+                kw.update(prompt_latents=lat, prompt_text=req.prompt_text)
+        segments = split_text(req.text, MAX_SEGMENT_CHARS) if req.split else [req.text]
+        # Segments run concurrently; the scheduler batches them on the GPU.
+        wavs = await asyncio.gather(*(self._generate(req.instruction + s, kw) for s in segments))
+        return join_segments(list(wavs), self.sample_rate), len(segments), info
+
+
+class VoxCPMEngine:
+    name = "default"
+
+    def __init__(self):
+        self.model = None
+        self.sample_rate = 0
+        self.lock = asyncio.Lock()
+
+    async def start(self):
+        await asyncio.to_thread(self._load)
+
+    def _load(self):
+        model_dir = resolve_model_dir()
+        from voxcpm import VoxCPM
+
+        self.model = VoxCPM.from_pretrained(model_dir, load_denoiser=False)
+        self.sample_rate = int(self.model.tts_model.sample_rate)
+        log(f"VoxCPM loaded; sample rate {self.sample_rate} Hz")
+
+    async def synthesize(self, req: TTSRequest):
+        async with self.lock:
+            return await asyncio.to_thread(self._synthesize, req)
+
+    def _synthesize(self, req: TTSRequest):
+        path = None
+        try:
+            kw = dict(cfg_value=req.cfg_value, inference_timesteps=req.inference_timesteps,
+                      retry_badcase=RETRY_BADCASE, normalize=False, denoise=False)
+            if req.ref_bytes is not None:
+                fd, path = tempfile.mkstemp(suffix=req.ref_suffix)
+                os.write(fd, req.ref_bytes)
+                os.close(fd)
+                kw["reference_wav_path"] = path
+                if req.mode == "hifi":
+                    kw.update(prompt_wav_path=path, prompt_text=req.prompt_text)
+            segments = split_text(req.text, MAX_SEGMENT_CHARS) if req.split else [req.text]
+            wavs = [np.asarray(self.model.generate(text=req.instruction + s, **kw), dtype=np.float32).reshape(-1)
+                    for s in segments]
+            return join_segments(wavs, self.sample_rate), len(segments), {}
+        finally:
+            if path:
+                os.unlink(path)
+
+
+# --------------------------------------------------------------------------- lifecycle
+_engine = None
+_engine_lock: asyncio.Lock | None = None
+
+
+async def get_engine():
+    """Load the engine once per worker, on the first job (the async nano server must be
+    created inside RunPod's event loop). Send {"warmup": true} to pre-load."""
+    global _engine, _engine_lock
+    if _engine is not None:
+        return _engine
+    if _engine_lock is None:
+        _engine_lock = asyncio.Lock()
+    async with _engine_lock:
+        if _engine is None:
+            t = time.perf_counter()
+            eng = NanoEngine() if ENGINE_NAME == "nano" else VoxCPMEngine()
+            await eng.start()
+            _engine = eng
+            log(f"Engine '{eng.name}' ready in {time.perf_counter() - t:.1f}s")
+    return _engine
+
+
+async def handler(job):
+    inp = job.get("input") or {}
+    try:
+        if inp.get("warmup"):
+            t = time.perf_counter()
+            eng = await get_engine()
+            return {"status": "warm", "engine": eng.name, "load_s": round(time.perf_counter() - t, 2),
+                    "voices": list_voices()}
+        req = await asyncio.to_thread(parse_request, inp)
+        t_load = time.perf_counter()
+        engine = await get_engine()
+        load_s = time.perf_counter() - t_load
+        t0 = time.perf_counter()
+        wav, n_segments, info = await engine.synthesize(req)
+        gen_s = time.perf_counter() - t0
+    except RequestError as e:
+        return {"error": str(e)}
+    except Exception as e:  # noqa: BLE001 - engine failure: report, then recycle the worker
+        log(traceback.format_exc())
+        out = {"error": f"{type(e).__name__}: {e}"}
+        if REFRESH_ON_ERROR:
+            out["refresh_worker"] = True
         return out
 
-    gap = np.zeros(int(sr * p["gap"]), dtype=np.float32)
-    joined = []
-    for i, w in enumerate(wavs):
-        joined.append(w)
-        if i < len(wavs) - 1:
-            joined.append(gap)
-    out["joined_b64"] = encode(np.concatenate(joined), sr, p["out_sr"])[0]
-    out["sentence_count"] = len(sentences)
-    if p["return_clips"]:
-        out["clips"] = clips
-    else:
-        out["clips"] = [{k: v for k, v in c.items() if k != "audio_b64"} for c in clips]
-    return out
+    if wav.size == 0:
+        return {"error": "no audio was generated"}
+    duration = wav.shape[0] / engine.sample_rate
+    return {
+        "audio_base64": encode_audio(wav, engine.sample_rate, req.output_format),
+        "format": req.output_format,
+        "sample_rate": engine.sample_rate,
+        "duration_s": round(duration, 3),
+        "generation_s": round(gen_s, 3),
+        "rtf": round(gen_s / duration, 4),
+        "engine": engine.name,
+        "mode": req.mode,
+        "segments": n_segments,
+        "cold_start_load_s": round(load_s, 2) if load_s > 0.5 else 0.0,
+        **info,
+        "warnings": req.warnings,
+    }
 
 
-def handler(job):
-    try:
-        return _handle(job)
-    except UserError as e:
-        return {"error": str(e)}
-    except Exception as e:
-        traceback.print_exc()
-        return {"error": f"{type(e).__name__}: {e}"}
+def concurrency_modifier(current_concurrency: int) -> int:
+    return MAX_CONCURRENCY if ENGINE_NAME == "nano" else 1
 
 
 if __name__ == "__main__":
-    init_engine()  # load the model before the worker starts taking jobs
-    runpod.serverless.start({"handler": handler})
+    if ENGINE_NAME not in ("nano", "default"):
+        sys.exit(f"ENGINE must be 'nano' or 'default', got '{ENGINE_NAME}'")
+    log(f"engine={ENGINE_NAME} model={MODEL_ID} concurrency={concurrency_modifier(0)} "
+        f"image_arch=sm_{IMAGE_FA_ARCH or '?'} voices={list_voices()}")
+    runpod.serverless.start({"handler": handler, "concurrency_modifier": concurrency_modifier})

@@ -1,11 +1,4 @@
-# VoxCPM2 on RunPod Serverless
-
-Text-to-speech endpoint for VoxCPM2 with two switchable engines:
-
-| `ENGINE` | Backend | Speed (RTX PRO 4000 Blackwell, Burmese) | Requests per worker |
-|---|---|---|---|
-| `nano` (default) | nanovllm-voxcpm + flash-attn | RTF ~0.13 | several at once (`MAX_CONCURRENCY`) |
-| `default` | reference VoxCPM | RTF ~0.45 | one at a time |
+My Runpod
 
 Nothing is compiled on a paid GPU: flash-attn wheels are built on free GitHub runners,
 and model weights come from RunPod's cached models, not the image.

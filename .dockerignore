@@ -1,0 +1,8 @@
+.git
+.github
+*.md
+!voices/*.md
+client.py
+test_input.json
+__pycache__
+*.pyc

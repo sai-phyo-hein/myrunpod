@@ -1,0 +1,112 @@
+# Compiles flash-attn once per GPU architecture on free GitHub runners (no GPU needed)
+# and attaches each wheel to its own GitHub Release. Run manually; rerun only when
+# versions.env changes (new nanovllm commit / torch / flash-attn).
+name: Build flash-attn wheels
+
+on:
+  workflow_dispatch:
+    inputs:
+      archs:
+        description: 'JSON list: 80 = Ampere/Ada (3090, 4090, A4000, A100, L4, L40S), 90 = Hopper (H100), 100 = B200, 120 = RTX Blackwell (RTX PRO, 5090)'
+        required: true
+        default: '["80","90","120"]'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: flash-attn sm_${{ matrix.arch }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 355
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: ${{ fromJSON(inputs.archs) }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Load versions.env
+        run: grep -E '^[A-Z_]+=' versions.env >> "$GITHUB_ENV"
+
+      - name: Free disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/share/swift
+          sudo docker image prune -af >/dev/null 2>&1 || true
+          df -h /
+
+      - name: Install CUDA toolkit ${{ env.CUDA_TOOLKIT }}
+        run: |
+          wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends "cuda-toolkit-${CUDA_TOOLKIT}"
+          CUDA_DIR="/usr/local/cuda-${CUDA_TOOLKIT/-/.}"
+          "$CUDA_DIR/bin/nvcc" --version
+          echo "CUDA_HOME=$CUDA_DIR" >> "$GITHUB_ENV"
+          echo "$CUDA_DIR/bin" >> "$GITHUB_PATH"
+          df -h /
+
+      - name: Install uv
+        run: |
+          curl -LsSf "https://astral.sh/uv/${UV_VERSION}/install.sh" | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Sync nanovllm-voxcpm (gives the exact torch the image will use)
+        run: |
+          git clone "$NANOVLLM_REPO" nanovllm
+          cd nanovllm
+          git checkout "$NANOVLLM_REF"
+          uv python install "$PYTHON_VERSION"
+          UV_PYTHON="$PYTHON_VERSION" uv sync --frozen --no-dev --no-install-package flash-attn
+          .venv/bin/python -c "import torch; print('torch', torch.__version__, 'CUDA', torch.version.cuda)"
+
+      - name: Download and patch flash-attn source
+        run: |
+          nanovllm/.venv/bin/python - "$FLASH_ATTN_VERSION" "$GITHUB_WORKSPACE/fa-src" <<'PY'
+          import json, os, shutil, sys, tarfile, tempfile, urllib.request
+          ver, dest = sys.argv[1], sys.argv[2]
+          meta = json.load(urllib.request.urlopen(f"https://pypi.org/pypi/flash-attn/{ver}/json"))
+          sdist = next(u for u in meta["urls"] if u["packagetype"] == "sdist")
+          tmp = tempfile.mkdtemp()
+          archive = os.path.join(tmp, sdist["filename"])
+          urllib.request.urlretrieve(sdist["url"], archive)
+          with tarfile.open(archive) as t:
+              top = t.getnames()[0].split("/")[0]
+              t.extractall(tmp, filter="data")
+          shutil.move(os.path.join(tmp, top), dest)
+          print("source:", dest)
+          PY
+          # torch >= 2.13-ish headers require C++20; flash-attn 2.8.x hardcodes C++17.
+          sed -i 's/c++17/c++20/g' fa-src/setup.py
+          grep -q "c++20" fa-src/setup.py
+
+      - name: Build wheel for sm_${{ matrix.arch }}
+        env:
+          FLASH_ATTN_CUDA_ARCHS: ${{ matrix.arch }}
+          FLASH_ATTENTION_FORCE_BUILD: "TRUE"
+          MAX_JOBS: "2"        # 16 GB runner RAM: 2 jobs x 2 nvcc threads is safe
+          NVCC_THREADS: "2"
+        run: |
+          A="${{ matrix.arch }}"
+          export TORCH_CUDA_ARCH_LIST="${A:0:-1}.${A: -1}"   # 120 -> 12.0, no GPU to detect
+          PY="$GITHUB_WORKSPACE/nanovllm/.venv/bin/python"
+          uv pip install --no-config --python "$PY" pip setuptools wheel ninja packaging psutil
+          cd /tmp
+          time "$PY" -m pip wheel --no-build-isolation --no-deps -v \
+            -w "$GITHUB_WORKSPACE/dist" "$GITHUB_WORKSPACE/fa-src" 2>&1 | tail -50
+          ls -lh "$GITHUB_WORKSPACE/dist"
+          test -n "$(ls "$GITHUB_WORKSPACE"/dist/*.whl)"
+
+      - name: Publish wheel to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="fa${FLASH_ATTN_VERSION}-nv${NANOVLLM_REF}-sm${{ matrix.arch }}"
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "$TAG" \
+            --notes "flash-attn ${FLASH_ATTN_VERSION} for sm_${{ matrix.arch }}, built against nanovllm-voxcpm@${NANOVLLM_REF} (torch from its uv.lock), Python ${PYTHON_VERSION}."
+          gh release upload "$TAG" dist/*.whl --clobber
+          echo "Published $TAG"

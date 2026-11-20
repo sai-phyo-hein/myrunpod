@@ -115,13 +115,26 @@ jobs:
           MON=$!
           cd /tmp
           set -o pipefail
-          # full output to build.log; ninja progress lines ([12/73] ...) and errors to the console
+          # full output to build.log; ninja progress lines ([12/73] ...) and errors to the console.
+          # pip -v indents backend output by two spaces, hence "^ *". "|| true" keeps grep's
+          # "no match" exit code from failing the step; pipefail still reports pip's own failure.
           time "$PY" -m pip wheel --no-build-isolation --no-deps -v \
             -w "$GITHUB_WORKSPACE/dist" "$GITHUB_WORKSPACE/fa-src" 2>&1 \
-            | tee "$LOG" | grep --line-buffered -E '^\[[0-9]+/[0-9]+\]|error|Error|FAILED|Killed' | cut -c1-220
+            | tee "$LOG" \
+            | { grep --line-buffered -E '^ *\[[0-9]+/[0-9]+\]|error|Error|FAILED|Killed' || true; } \
+            | cut -c1-220
           kill $MON || true
           ls -lh "$GITHUB_WORKSPACE/dist"
           test -n "$(ls "$GITHUB_WORKSPACE"/dist/*.whl)"
+
+      - name: Upload wheel (safety net, so a long compile is never lost)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-sm${{ strategy.job-index }}
+          path: dist/*.whl
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Upload build log
         if: always()

@@ -43,7 +43,8 @@ COPY wheels/ /tmp/wheels/
 RUN set -eux; ls -l /tmp/wheels/*.whl; \
     uv pip install --no-config --python /opt/venv/bin/python --no-deps /tmp/wheels/*.whl
 
-# 3. RunPod SDK and (optionally) the reference VoxCPM engine, in the SAME environment.
+# 3. RunPod SDK, the handler's own dependencies (boto3 for R2 uploads, librosa for
+#    resampling) and (optionally) the reference VoxCPM engine, in the SAME environment.
 #    Constraints keep torch/torchaudio/triton exactly as locked, so no second torch is
 #    pulled in. If VoxCPM can't live with this torch, the build fails here, loudly.
 RUN set -eux; \
@@ -52,12 +53,12 @@ RUN set -eux; \
     cat /tmp/constraints.txt; \
     extra=""; [ "$INSTALL_VOXCPM" = "1" ] && extra="$VOXCPM_SPEC"; \
     uv pip install --no-config --python /opt/venv/bin/python \
-      --constraint /tmp/constraints.txt runpod $extra
+      --constraint /tmp/constraints.txt runpod boto3 librosa $extra
 
 # Import-free sanity check (importing flash-attn needs a GPU driver, absent here)
 RUN /opt/venv/bin/python - <<'PY'
 import importlib.util as u, os
-mods = ["nanovllm_voxcpm", "flash_attn", "runpod", "soundfile"]
+mods = ["nanovllm_voxcpm", "flash_attn", "runpod", "soundfile", "boto3", "librosa"]
 if os.environ.get("INSTALL_VOXCPM", "1") == "1":
     mods.append("voxcpm")
 missing = [m for m in mods if u.find_spec(m) is None]
@@ -76,13 +77,16 @@ RUN apt-get update \
 
 COPY --from=builder /opt/venv /opt/venv
 WORKDIR /app
-COPY handler.py /app/handler.py
+# Every top-level .py file: handler.py plus helper modules it imports (e.g. check_env.py)
+COPY *.py /app/
+COPY voices/ /app/voices/
 
 ENV PATH=/opt/venv/bin:$PATH \
     PYTHONUNBUFFERED=1 \
     ENGINE=nano \
     MODEL_ID=openbmb/VoxCPM2 \
     FLASH_ATTN_ARCH=${FA_ARCH} \
+    PYTHONPATH=/app \
     HF_HOME=/tmp/hf \
     TRITON_CACHE_DIR=/tmp/triton
 

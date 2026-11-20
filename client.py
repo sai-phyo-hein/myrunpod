@@ -27,7 +27,8 @@ def call(url, key, payload=None, timeout=330):
     data = json.dumps(payload).encode() if payload is not None else None
     req = urllib.request.Request(
         url, data=data, method="POST" if data else "GET",
-        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json",
+                 "User-Agent": "voxcpm-client/1.0"},
     )
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:

@@ -9,7 +9,7 @@ on:
       archs:
         description: 'JSON list. 80 = Ampere/Ada (3090, 4090, A4000, A100, L4, L40S), 90 = Hopper (H100), 100 = B200, 120 = RTX Blackwell (RTX PRO, 5090). Combine with ";" for one multi-GPU wheel, e.g. ["80;120"] (compiles ~2x longer)'
         required: true
-        default: '["80","90","120"]'
+        default: '["80;120"]'
 
 permissions:
   contents: write

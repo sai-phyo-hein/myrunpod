@@ -9,7 +9,7 @@ on:
       archs:
         description: 'JSON list of archs to build, same entries as the wheel build, e.g. ["80;120"] (wheels must exist)'
         required: true
-        default: '["80","90","120"]'
+        default: '["80;120"]'
       install_voxcpm:
         description: 'Include the reference VoxCPM engine (ENGINE=default)'
         type: boolean

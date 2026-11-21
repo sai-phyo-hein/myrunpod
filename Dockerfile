@@ -87,7 +87,7 @@ COPY voices/ /app/voices/
 ENV PATH=/opt/venv/bin:$PATH \
     PYTHONUNBUFFERED=1 \
     ENGINE=nano \
-    MODEL_ID=openbmb/VoxCPM2 \
+    MODEL_ID=saiphyohein/VoxCPM2 \
     FLASH_ATTN_ARCH=${FA_ARCH} \
     PYTHONPATH=/app \
     HF_HOME=/tmp/hf \

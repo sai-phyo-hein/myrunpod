@@ -95,6 +95,7 @@ def main():
         f.write(base64.b64decode(out["audio_base64"]))
     queue_s = res.get("delayTime", 0) / 1000
     exec_s = res.get("executionTime", 0) / 1000
+    print(f"Job {res.get('id')}  saved {args.output} ...")
     print(f"Saved {args.output}  ({out['duration_s']:.2f}s audio @ {out['sample_rate']} Hz, "
           f"{out['engine']} / {out['mode']}, {out['segments']} segment(s))")
     print(f"  generation {out['generation_s']:.2f}s | RTF {out['rtf']:.3f}"

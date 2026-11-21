@@ -624,4 +624,6 @@ if __name__ == "__main__":
         threading.Thread(target=lookup_location, daemon=True).start()
     log(f"engine={ENGINE_NAME} model={MODEL_ID} concurrency={concurrency_modifier(0)} "
         f"image_arch=sm_{IMAGE_FA_ARCH or '?'} voices={list_voices()}")
+    log(f"job {job.get('id', '?')}: mode={req.mode} chars={len(req.text)} "
+        f"segments={n_segments} audio={duration:.2f}s gen={gen_s:.2f}s")
     runpod.serverless.start({"handler": handler, "concurrency_modifier": concurrency_modifier})

@@ -104,6 +104,8 @@ def main():
         print(f"  reference latents cached: {out['reference_cache_hit']}")
     for w in out.get("warnings", []):
         print(f"  warning: {w}")
+    if out.get("worker"):
+        print("  worker " + " | ".join(f"{k}={v}" for k, v in out["worker"].items()))
 
 
 if __name__ == "__main__":

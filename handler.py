@@ -29,9 +29,12 @@ import time
 import traceback
 import urllib.parse
 import urllib.request
+import threading
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
+
+PROCESS_START = time.time()  # worker (container) start, before heavy imports
 
 import numpy as np
 import runpod
@@ -55,6 +58,7 @@ RETRY_BADCASE = os.getenv("RETRY_BADCASE", "1") == "1"            # default engi
 SMOKE_TEST = os.getenv("SMOKE_TEST", "1") == "1"
 REFRESH_ON_ERROR = os.getenv("REFRESH_ON_ERROR", "1") == "1"
 IMAGE_FA_ARCH = os.getenv("FLASH_ATTN_ARCH", "")                   # baked in by the Dockerfile
+LOG_GEO = os.getenv("LOG_GEO", "1") == "1"                         # look up worker location once
 RUNPOD_HF_CACHE = os.getenv("RUNPOD_HF_CACHE", "/runpod-volume/huggingface-cache/hub")
 
 MODES = ("design", "clone", "hifi")
@@ -68,6 +72,61 @@ def log(*args):
 
 class RequestError(ValueError):
     """Bad input. Reported to the caller; the worker stays healthy."""
+
+
+# --------------------------------------------------------------------------- worker info
+# Identifying values only; never log the platform's secret variables (API keys, job URLs).
+WORKER_ENV = {
+    "worker_id": ("RUNPOD_POD_ID", "CONTAINER_ID"),            # RunPod, then Vast
+    "datacenter": ("RUNPOD_DC_ID",),
+    "endpoint_id": ("RUNPOD_ENDPOINT_ID",),
+    "hostname": ("RUNPOD_POD_HOSTNAME", "HOSTNAME"),
+    "public_ip": ("RUNPOD_PUBLIC_IP", "PUBLIC_IPADDR"),
+    "gpu_count": ("RUNPOD_GPU_COUNT", "GPU_COUNT"),
+}
+WORKER: dict = {}
+
+
+def collect_worker_info() -> dict:
+    env = os.environ
+    if any(k.startswith("RUNPOD_") for k in env):
+        WORKER["platform"] = "runpod"
+    elif "CONTAINER_API_KEY" in env or any(k.startswith("VAST_") for k in env):
+        WORKER["platform"] = "vast"
+    else:
+        WORKER["platform"] = "local"
+    for key, names in WORKER_ENV.items():
+        val = next((env[n] for n in names if env.get(n)), None)
+        if val:
+            WORKER[key] = val
+    try:  # nvidia-smi, not torch: a CUDA context here would take VRAM from the engine
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name,memory.total,driver_version", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=10).stdout.strip().splitlines()
+        if out:
+            name, mem, driver = (x.strip() for x in out[0].split(","))
+            WORKER.update(gpu=name, gpu_memory=mem, driver=driver)
+    except Exception as e:  # noqa: BLE001
+        WORKER["gpu"] = f"unknown ({type(e).__name__})"
+    return WORKER
+
+
+def lookup_location():
+    """Public IP geolocation, in a background thread so it never delays start-up."""
+    try:
+        with urllib.request.urlopen("https://ipinfo.io/json", timeout=3) as r:
+            geo = json.loads(r.read())
+        WORKER["location"] = ", ".join(x for x in (geo.get("city"), geo.get("region"), geo.get("country")) if x)
+        WORKER.setdefault("public_ip", geo.get("ip"))
+        log(f"worker location: {WORKER['location']} ({geo.get('org', '?')})")
+    except Exception as e:  # noqa: BLE001
+        log(f"worker location lookup failed: {type(e).__name__}: {e}")
+
+
+def worker_summary() -> dict:
+    """Short worker description added to every response."""
+    keys = ("platform", "worker_id", "datacenter", "location", "gpu")
+    return {k: WORKER[k] for k in keys if WORKER.get(k)}
 
 
 # --------------------------------------------------------------------------- helpers
@@ -502,7 +561,8 @@ async def get_engine():
             eng = NanoEngine() if ENGINE_NAME == "nano" else VoxCPMEngine()
             await eng.start()
             _engine = eng
-            log(f"Engine '{eng.name}' ready in {time.perf_counter() - t:.1f}s")
+            log(f"Engine '{eng.name}' ready in {time.perf_counter() - t:.1f}s "
+                f"({time.time() - PROCESS_START:.1f}s after worker start)")
     return _engine
 
 
@@ -513,7 +573,7 @@ async def handler(job):
             t = time.perf_counter()
             eng = await get_engine()
             return {"status": "warm", "engine": eng.name, "load_s": round(time.perf_counter() - t, 2),
-                    "voices": list_voices()}
+                    "voices": list_voices(), "worker": worker_summary()}
         req = await asyncio.to_thread(parse_request, inp)
         t_load = time.perf_counter()
         engine = await get_engine()
@@ -525,7 +585,7 @@ async def handler(job):
         return {"error": str(e)}
     except Exception as e:  # noqa: BLE001 - engine failure: report, then recycle the worker
         log(traceback.format_exc())
-        out = {"error": f"{type(e).__name__}: {e}"}
+        out = {"error": f"{type(e).__name__}: {e}", "worker": worker_summary()}
         if REFRESH_ON_ERROR:
             out["refresh_worker"] = True
         return out
@@ -546,6 +606,7 @@ async def handler(job):
         "cold_start_load_s": round(load_s, 2) if load_s > 0.5 else 0.0,
         **info,
         "warnings": req.warnings,
+        "worker": worker_summary(),
     }
 
 
@@ -556,6 +617,11 @@ def concurrency_modifier(current_concurrency: int) -> int:
 if __name__ == "__main__":
     if ENGINE_NAME not in ("nano", "default"):
         sys.exit(f"ENGINE must be 'nano' or 'default', got '{ENGINE_NAME}'")
+    log(f"worker start: {json.dumps(collect_worker_info())}")
+    platform_vars = sorted(k for k in os.environ if k.startswith(("RUNPOD_", "VAST_")))
+    log(f"platform variables present (names only): {platform_vars}")
+    if LOG_GEO:
+        threading.Thread(target=lookup_location, daemon=True).start()
     log(f"engine={ENGINE_NAME} model={MODEL_ID} concurrency={concurrency_modifier(0)} "
         f"image_arch=sm_{IMAGE_FA_ARCH or '?'} voices={list_voices()}")
     runpod.serverless.start({"handler": handler, "concurrency_modifier": concurrency_modifier})

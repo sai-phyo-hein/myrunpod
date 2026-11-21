@@ -71,8 +71,11 @@ FROM ${PYTHON_IMAGE}
 ARG FA_ARCH=""
 
 # ffmpeg: torchaudio/torchcodec use it to read reference audio (mp3, flac, ...)
+# gcc + libc6-dev: Triton builds its CUDA helper (cuda_utils.so) and the kernels behind torch.compile
+#   at runtime with the system C compiler; without one the engine fails during warmup with
+#   "Failed to find C compiler". Python's headers are already in the official python image.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ffmpeg ca-certificates \
+ && apt-get install -y --no-install-recommends ffmpeg ca-certificates gcc libc6-dev \
  && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /opt/venv /opt/venv
@@ -88,6 +91,10 @@ ENV PATH=/opt/venv/bin:$PATH \
     FLASH_ATTN_ARCH=${FA_ARCH} \
     PYTHONPATH=/app \
     HF_HOME=/tmp/hf \
-    TRITON_CACHE_DIR=/tmp/triton
+    TRITON_CACHE_DIR=/tmp/triton \
+    CC=gcc
+
+# Fail the build, not the first job, if the compiler is missing
+RUN gcc --version | head -n1 && test -f "$(python -c 'import sysconfig; print(sysconfig.get_paths()["include"])')/Python.h"
 
 CMD ["python", "-u", "/app/handler.py"]

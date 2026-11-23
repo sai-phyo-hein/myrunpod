@@ -10,6 +10,9 @@ Modes (https://voxcpm.readthedocs.io/en/latest/usage_guide.html#three-generation
   clone   timbre from reference audio, style from an optional instruction
   hifi    reference audio + its exact transcript, highest similarity
 
+The transcript (prompt_text) can come as a link: prompt_text_url, e.g. a presigned R2 URL of the .txt saved next to
+the reference .wav, so callers keep it in storage instead of sending it. It wins over an inline prompt_text.
+
 Request / response format: see README.md. Local test: python handler.py (reads test_input.json).
 """
 from __future__ import annotations
@@ -52,6 +55,7 @@ MAX_SEGMENT_CHARS = int(os.getenv("MAX_SEGMENT_CHARS", "250"))
 SEGMENT_GAP_S = float(os.getenv("SEGMENT_GAP_S", "0.15"))
 MAX_REF_BYTES = int(os.getenv("MAX_REF_MB", "20")) * 1024 * 1024
 MAX_REF_SECONDS = float(os.getenv("MAX_REF_SECONDS", "60"))
+MAX_PROMPT_TEXT_BYTES = int(os.getenv("MAX_PROMPT_TEXT_KB", "64")) * 1024  # prompt_text_url download cap
 ALLOW_REF_URL = os.getenv("ALLOW_REF_URL", "1") == "1"
 LATENT_CACHE_SIZE = int(os.getenv("LATENT_CACHE_SIZE", "32"))
 RETRY_BADCASE = os.getenv("RETRY_BADCASE", "1") == "1"            # default engine only
@@ -290,6 +294,30 @@ def fetch_url(url: str):
     return data, suffix if suffix in AUDIO_EXTS else ".wav"
 
 
+def fetch_text(url: str) -> str:
+    """The transcript at prompt_text_url (same rules as reference_audio_url), as one line of text."""
+    if not ALLOW_REF_URL:
+        raise RequestError("prompt_text_url is disabled on this endpoint")
+    if not url.startswith(("https://", "http://")):
+        raise RequestError("prompt_text_url must be http(s)")
+    req = urllib.request.Request(url, headers={"User-Agent": "voxcpm-runpod"})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            data = r.read(MAX_PROMPT_TEXT_BYTES + 1)
+    except Exception as e:  # noqa: BLE001
+        raise RequestError(f"could not download prompt_text_url: {e}") from e
+    if len(data) > MAX_PROMPT_TEXT_BYTES:
+        raise RequestError(f"prompt_text_url is larger than {MAX_PROMPT_TEXT_BYTES // 1024} KB")
+    try:
+        text = data.decode("utf-8-sig")
+    except UnicodeDecodeError as e:
+        raise RequestError("prompt_text_url is not UTF-8 text") from e
+    text = re.sub(r"\s+", " ", text).strip()
+    if not text:
+        raise RequestError("prompt_text_url is empty")
+    return text
+
+
 def check_reference(data: bytes, warnings: list):
     try:
         info = sf.info(io.BytesIO(data))
@@ -310,7 +338,12 @@ def parse_request(inp: dict) -> TTSRequest:
         raise RequestError(f"'text' is {len(text)} characters; max {MAX_TEXT_CHARS}")
 
     ref_bytes, ref_suffix = None, ".wav"
+    # Transcript of the reference: prompt_text_url (read from storage) > prompt_text > the preset voice's .txt
     prompt_text = inp.get("prompt_text")
+    if inp.get("prompt_text_url"):
+        if prompt_text:
+            warnings.append("prompt_text ignored: prompt_text_url given")
+        prompt_text = fetch_text(str(inp["prompt_text_url"]))
     if inp.get("voice"):
         ref_bytes, ref_suffix, voice_txt = load_voice(str(inp["voice"]))
         prompt_text = prompt_text or voice_txt
@@ -333,7 +366,7 @@ def parse_request(inp: dict) -> TTSRequest:
     if mode in ("clone", "hifi") and ref_bytes is None:
         raise RequestError(f"mode '{mode}' needs 'voice', 'reference_audio_base64' or 'reference_audio_url'")
     if mode == "hifi" and not prompt_text:
-        raise RequestError("mode 'hifi' needs 'prompt_text' (exact transcript of the reference audio)")
+        raise RequestError("mode 'hifi' needs 'prompt_text' or 'prompt_text_url' (exact transcript of the reference audio)")
     if mode == "design" and ref_bytes is not None:
         warnings.append("reference audio ignored in design mode")
         ref_bytes = None

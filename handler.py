@@ -569,6 +569,7 @@ async def get_engine():
 
 async def handler(job):
     inp = job.get("input") or {}
+    log(f"Input: {inp}")
     try:
         if inp.get("warmup"):
             t = time.perf_counter()

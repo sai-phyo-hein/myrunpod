@@ -55,6 +55,7 @@ MAX_REF_SECONDS = float(os.getenv("MAX_REF_SECONDS", "60"))
 ALLOW_REF_URL = os.getenv("ALLOW_REF_URL", "1") == "1"
 LATENT_CACHE_SIZE = int(os.getenv("LATENT_CACHE_SIZE", "32"))
 RETRY_BADCASE = os.getenv("RETRY_BADCASE", "1") == "1"            # default engine only
+NORMALIZE_AUDIO = os.getenv("NORMALIZE_AUDIO", "0") == "1"        # default engine only
 SMOKE_TEST = os.getenv("SMOKE_TEST", "1") == "1"
 REFRESH_ON_ERROR = os.getenv("REFRESH_ON_ERROR", "1") == "1"
 IMAGE_FA_ARCH = os.getenv("FLASH_ATTN_ARCH", "")                   # baked in by the Dockerfile
@@ -525,7 +526,7 @@ class VoxCPMEngine:
         path = None
         try:
             kw = dict(cfg_value=req.cfg_value, inference_timesteps=req.inference_timesteps,
-                      retry_badcase=RETRY_BADCASE, normalize=False, denoise=False)
+                      retry_badcase=RETRY_BADCASE, normalize=NORMALIZE_AUDIO, denoise=False)
             if req.ref_bytes is not None:
                 fd, path = tempfile.mkstemp(suffix=req.ref_suffix)
                 os.write(fd, req.ref_bytes)

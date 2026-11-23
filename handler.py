@@ -593,6 +593,8 @@ async def handler(job):
     if wav.size == 0:
         return {"error": "no audio was generated"}
     duration = wav.shape[0] / engine.sample_rate
+    log(f"job {job.get('id', '?')}: mode={req.mode} chars={len(req.text)} "
+        f"segments={n_segments} audio={duration:.2f}s gen={gen_s:.2f}s")
     return {
         "audio_base64": encode_audio(wav, engine.sample_rate, req.output_format),
         "format": req.output_format,
@@ -624,6 +626,4 @@ if __name__ == "__main__":
         threading.Thread(target=lookup_location, daemon=True).start()
     log(f"engine={ENGINE_NAME} model={MODEL_ID} concurrency={concurrency_modifier(0)} "
         f"image_arch=sm_{IMAGE_FA_ARCH or '?'} voices={list_voices()}")
-    log(f"job {job.get('id', '?')}: mode={req.mode} chars={len(req.text)} "
-        f"segments={n_segments} audio={duration:.2f}s gen={gen_s:.2f}s")
     runpod.serverless.start({"handler": handler, "concurrency_modifier": concurrency_modifier})
